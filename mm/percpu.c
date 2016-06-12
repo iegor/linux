@@ -125,6 +125,7 @@ static int pcpu_nr_units __read_mostly;
 static int pcpu_atom_size __read_mostly;
 static int pcpu_nr_slots __read_mostly;
 static size_t pcpu_chunk_struct_size __read_mostly;
+static int pcpu_pfns;
 
 /* cpus with the lowest and highest unit addresses */
 static unsigned int pcpu_low_unit_cpu __read_mostly;
@@ -305,16 +306,12 @@ static void *pcpu_mem_zalloc(size_t size)
 /**
  * pcpu_mem_free - free memory
  * @ptr: memory to free
- * @size: size of the area
  *
  * Free @ptr.  @ptr should have been allocated using pcpu_mem_zalloc().
  */
-static void pcpu_mem_free(void *ptr, size_t size)
+static void pcpu_mem_free(void *ptr)
 {
-	if (size <= PAGE_SIZE)
-		kfree(ptr);
-	else
-		vfree(ptr);
+	kvfree(ptr);
 }
 
 /**
@@ -463,8 +460,8 @@ out_unlock:
 	 * pcpu_mem_free() might end up calling vfree() which uses
 	 * IRQ-unsafe lock and thus can't be called under pcpu_lock.
 	 */
-	pcpu_mem_free(old, old_size);
-	pcpu_mem_free(new, new_size);
+	pcpu_mem_free(old);
+	pcpu_mem_free(new);
 
 	return 0;
 }
@@ -732,7 +729,7 @@ static struct pcpu_chunk *pcpu_alloc_chunk(void)
 	chunk->map = pcpu_mem_zalloc(PCPU_DFL_MAP_ALLOC *
 						sizeof(chunk->map[0]));
 	if (!chunk->map) {
-		pcpu_mem_free(chunk, pcpu_chunk_struct_size);
+		pcpu_mem_free(chunk);
 		return NULL;
 	}
 
@@ -753,8 +750,8 @@ static void pcpu_free_chunk(struct pcpu_chunk *chunk)
 {
 	if (!chunk)
 		return;
-	pcpu_mem_free(chunk->map, chunk->map_alloc * sizeof(chunk->map[0]));
-	pcpu_mem_free(chunk, pcpu_chunk_struct_size);
+	pcpu_mem_free(chunk->map);
+	pcpu_mem_free(chunk);
 }
 
 /**
@@ -1794,6 +1791,7 @@ static struct pcpu_alloc_info * __init pcpu_build_alloc_info(
 	/* calculate size_sum and ensure dyn_size is enough for early alloc */
 	size_sum = PFN_ALIGN(static_size + reserved_size +
 			    max_t(size_t, dyn_size, PERCPU_DYNAMIC_EARLY_SIZE));
+        pcpu_pfns = PFN_DOWN(size_sum);
 	dyn_size = size_sum - static_size - reserved_size;
 
 	/*
@@ -2280,6 +2278,22 @@ void __init percpu_init_late(void)
 		spin_unlock_irqrestore(&pcpu_lock, flags);
 	}
 }
+
+#ifdef CONFIG_TOI_INCREMENTAL
+/*
+ * It doesn't matter if we mark an extra page as untracked (and therefore
+ * always save it in incremental images).
+ */
+void toi_mark_per_cpus_pages_untracked(void)
+{
+    int i;
+
+    struct page *page = virt_to_page(pcpu_base_addr);
+
+    for (i = 0; i < pcpu_pfns; i++)
+        SetPageTOI_Untracked(page + i);
+}
+#endif
 
 /*
  * Percpu allocator is initialized early during boot when neither slab or

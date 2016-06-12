@@ -33,6 +33,7 @@
 #include <linux/bootmem.h>
 #include <linux/memblock.h>
 #include <linux/syscalls.h>
+#include <linux/suspend.h>
 #include <linux/kexec.h>
 #include <linux/kdb.h>
 #include <linux/ratelimit.h>
@@ -233,7 +234,11 @@ struct printk_log {
 	u8 facility;		/* syslog facility */
 	u8 flags:5;		/* internal record flags */
 	u8 level:3;		/* syslog level */
-};
+}
+#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+__packed __aligned(4)
+#endif
+;
 
 /*
  * The logbuf_lock protects kmsg buffer, indices, counters.  This can be taken
@@ -274,15 +279,25 @@ static u32 clear_idx;
 #define LOG_FACILITY(v)		((v) >> 3 & 0xff)
 
 /* record buffer */
-#if defined(CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS)
-#define LOG_ALIGN 4
-#else
 #define LOG_ALIGN __alignof__(struct printk_log)
-#endif
 #define __LOG_BUF_LEN (1 << CONFIG_LOG_BUF_SHIFT)
 static char __log_buf[__LOG_BUF_LEN] __aligned(LOG_ALIGN);
 static char *log_buf = __log_buf;
 static u32 log_buf_len = __LOG_BUF_LEN;
+
+#ifdef CONFIG_TOI_INCREMENTAL
+void toi_set_logbuf_untracked(void)
+{
+    int i;
+    struct page *log_buf_start_page = virt_to_page(__log_buf);
+
+    printk("Not protecting kernel printk log buffer (%p-%p).\n",
+            __log_buf, __log_buf + __LOG_BUF_LEN);
+
+    for (i = 0; i < (1 << (CONFIG_LOG_BUF_SHIFT - PAGE_SHIFT)); i++)
+        SetPageTOI_Untracked(log_buf_start_page + i);
+}
+#endif
 
 /* Return log buffer address */
 char *log_buf_addr_get(void)

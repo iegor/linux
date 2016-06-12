@@ -62,6 +62,7 @@
 #include <linux/hugetlb.h>
 #include <linux/sched/rt.h>
 #include <linux/page_owner.h>
+#include <linux/tuxonice.h>
 #include <linux/kthread.h>
 
 #include <asm/sections.h>
@@ -751,6 +752,12 @@ static inline int free_pages_check(struct page *page)
 	if (unlikely(page->mem_cgroup))
 		bad_reason = "page still charged to cgroup";
 #endif
+        if (unlikely(PageTOI_Untracked(page))) {
+            // Make it writable and included in image if allocated.
+            ClearPageTOI_Untracked(page);
+            // If it gets allocated, it will be dirty from TOI's POV.
+            SetPageTOI_Dirty(page);
+        }
 	if (unlikely(bad_reason)) {
 		bad_page(page, bad_reason, bad_flags);
 		return 1;
@@ -1390,6 +1397,11 @@ static int prep_new_page(struct page *page, unsigned int order, gfp_t gfp_flags,
 		struct page *p = page + i;
 		if (unlikely(check_new_page(p)))
 			return 1;
+                if (unlikely(toi_incremental_support() && gfp_flags & ___GFP_TOI_NOTRACK)) {
+                    // Make the page writable if it's protected, and set it to be untracked.
+                    SetPageTOI_Untracked(p);
+                    toi_make_writable(init_mm.pgd, (unsigned long) page_address(p));
+                }
 	}
 
 	set_page_private(page, 0);
@@ -5210,6 +5222,11 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat)
 	pgdat->numabalancing_migrate_nr_pages = 0;
 	pgdat->numabalancing_migrate_next_window = jiffies;
 #endif
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	spin_lock_init(&pgdat->split_queue_lock);
+	INIT_LIST_HEAD(&pgdat->split_queue);
+	pgdat->split_queue_len = 0;
+#endif
 	init_waitqueue_head(&pgdat->kswapd_wait);
 	init_waitqueue_head(&pgdat->pfmemalloc_wait);
 	pgdat_page_ext_init(pgdat);
@@ -6615,7 +6632,7 @@ bool is_pageblock_removable_nolock(struct page *page)
 	return !has_unmovable_pages(zone, page, 0, true);
 }
 
-#ifdef CONFIG_CMA
+#if (defined(CONFIG_MEMORY_ISOLATION) && defined(CONFIG_COMPACTION)) || defined(CONFIG_CMA)
 
 static unsigned long pfn_max_align_down(unsigned long pfn)
 {

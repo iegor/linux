@@ -560,13 +560,13 @@ static int __add_missing_keys(struct btrfs_fs_info *fs_info,
  */
 static void __merge_refs(struct list_head *head, int mode)
 {
-	struct __prelim_ref *ref1;
+	struct __prelim_ref *pos1;
 
-	list_for_each_entry(ref1, head, list) {
-		struct __prelim_ref *ref2 = ref1, *tmp;
+	list_for_each_entry(pos1, head, list) {
+		struct __prelim_ref *pos2 = pos1, *tmp;
 
-		list_for_each_entry_safe_continue(ref2, tmp, head, list) {
-			struct __prelim_ref *xchg;
+		list_for_each_entry_safe_continue(pos2, tmp, head, list) {
+			struct __prelim_ref *xchg, *ref1 = pos1, *ref2 = pos2;
 			struct extent_inode_elem *eie;
 
 			if (!ref_for_same_block(ref1, ref2))
@@ -1406,7 +1406,8 @@ char *btrfs_ref_to_path(struct btrfs_root *fs_root, struct btrfs_path *path,
 			read_extent_buffer(eb, dest + bytes_left,
 					   name_off, name_len);
 		if (eb != eb_in) {
-			btrfs_tree_read_unlock_blocking(eb);
+			if (!path->skip_locking)
+				btrfs_tree_read_unlock_blocking(eb);
 			free_extent_buffer(eb);
 		}
 		ret = btrfs_find_item(fs_root, path, parent, 0,
@@ -1426,9 +1427,10 @@ char *btrfs_ref_to_path(struct btrfs_root *fs_root, struct btrfs_path *path,
 		eb = path->nodes[0];
 		/* make sure we can use eb after releasing the path */
 		if (eb != eb_in) {
-			atomic_inc(&eb->refs);
-			btrfs_tree_read_lock(eb);
-			btrfs_set_lock_blocking_rw(eb, BTRFS_READ_LOCK);
+			if (!path->skip_locking)
+				btrfs_set_lock_blocking_rw(eb, BTRFS_READ_LOCK);
+			path->nodes[0] = NULL;
+			path->locks[0] = 0;
 		}
 		btrfs_release_path(path);
 		iref = btrfs_item_ptr(eb, slot, struct btrfs_inode_ref);

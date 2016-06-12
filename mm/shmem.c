@@ -701,8 +701,7 @@ static void shmem_evict_inode(struct inode *inode)
 			list_del_init(&info->swaplist);
 			mutex_unlock(&shmem_swaplist_mutex);
 		}
-	} else
-		kfree(info->symlink);
+	}
 
 	simple_xattrs_free(&info->xattrs);
 	WARN_ON(inode->i_blocks);
@@ -912,6 +911,9 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	if (!swap.val)
 		goto redirty;
 
+	if (mem_cgroup_try_charge_swap(page, swap))
+		goto free_swap;
+
 	/*
 	 * Add inode to shmem_unuse()'s list of swapped-out inodes,
 	 * if it's not already there.  Do it now before the page is
@@ -940,6 +942,7 @@ static int shmem_writepage(struct page *page, struct writeback_control *wbc)
 	}
 
 	mutex_unlock(&shmem_swaplist_mutex);
+free_swap:
 	swapcache_free(swap);
 redirty:
 	set_page_dirty(page);
@@ -1497,7 +1500,7 @@ static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
 }
 
 static struct inode *shmem_get_inode(struct super_block *sb, const struct inode *dir,
-				     umode_t mode, dev_t dev, unsigned long flags)
+				     umode_t mode, dev_t dev, unsigned long flags, int atomic_copy)
 {
 	struct inode *inode;
 	struct shmem_inode_info *info;
@@ -1518,6 +1521,8 @@ static struct inode *shmem_get_inode(struct super_block *sb, const struct inode 
 		spin_lock_init(&info->lock);
 		info->seals = F_SEAL_SEAL;
 		info->flags = flags & VM_NORESERVE;
+		if (atomic_copy)
+			inode->i_flags |= S_ATOMIC_COPY;
 		INIT_LIST_HEAD(&info->swaplist);
 		simple_xattrs_init(&info->xattrs);
 		cache_no_acl(inode);
@@ -1898,7 +1903,7 @@ static loff_t shmem_file_llseek(struct file *file, loff_t offset, int whence)
 	if (whence != SEEK_DATA && whence != SEEK_HOLE)
 		return generic_file_llseek_size(file, offset, whence,
 					MAX_LFS_FILESIZE, i_size_read(inode));
-	mutex_lock(&inode->i_mutex);
+	inode_lock(inode);
 	/* We're holding i_mutex so we can access i_size directly */
 
 	if (offset < 0)
@@ -1922,7 +1927,7 @@ static loff_t shmem_file_llseek(struct file *file, loff_t offset, int whence)
 
 	if (offset >= 0)
 		offset = vfs_setpos(file, offset, MAX_LFS_FILESIZE);
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 	return offset;
 }
 
@@ -2087,7 +2092,7 @@ int shmem_add_seals(struct file *file, unsigned int seals)
 	if (seals & ~(unsigned int)F_ALL_SEALS)
 		return -EINVAL;
 
-	mutex_lock(&inode->i_mutex);
+	inode_lock(inode);
 
 	if (info->seals & F_SEAL_SEAL) {
 		error = -EPERM;
@@ -2110,7 +2115,7 @@ int shmem_add_seals(struct file *file, unsigned int seals)
 	error = 0;
 
 unlock:
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 	return error;
 }
 EXPORT_SYMBOL_GPL(shmem_add_seals);
@@ -2160,7 +2165,7 @@ static long shmem_fallocate(struct file *file, int mode, loff_t offset,
 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
 		return -EOPNOTSUPP;
 
-	mutex_lock(&inode->i_mutex);
+	inode_lock(inode);
 
 	if (mode & FALLOC_FL_PUNCH_HOLE) {
 		struct address_space *mapping = file->f_mapping;
@@ -2273,7 +2278,7 @@ undone:
 	inode->i_private = NULL;
 	spin_unlock(&inode->i_lock);
 out:
-	mutex_unlock(&inode->i_mutex);
+	inode_unlock(inode);
 	return error;
 }
 
@@ -2307,7 +2312,7 @@ shmem_mknod(struct inode *dir, struct dentry *dentry, umode_t mode, dev_t dev)
 	struct inode *inode;
 	int error = -ENOSPC;
 
-	inode = shmem_get_inode(dir->i_sb, dir, mode, dev, VM_NORESERVE);
+	inode = shmem_get_inode(dir->i_sb, dir, mode, dev, VM_NORESERVE, 0);
 	if (inode) {
 		error = simple_acl_create(dir, inode);
 		if (error)
@@ -2336,7 +2341,7 @@ shmem_tmpfile(struct inode *dir, struct dentry *dentry, umode_t mode)
 	struct inode *inode;
 	int error = -ENOSPC;
 
-	inode = shmem_get_inode(dir->i_sb, dir, mode, 0, VM_NORESERVE);
+	inode = shmem_get_inode(dir->i_sb, dir, mode, 0, VM_NORESERVE, 0);
 	if (inode) {
 		error = security_inode_init_security(inode, dir,
 						     NULL,
@@ -2528,7 +2533,7 @@ static int shmem_symlink(struct inode *dir, struct dentry *dentry, const char *s
 	if (len > PAGE_CACHE_SIZE)
 		return -ENAMETOOLONG;
 
-	inode = shmem_get_inode(dir->i_sb, dir, S_IFLNK|S_IRWXUGO, 0, VM_NORESERVE);
+	inode = shmem_get_inode(dir->i_sb, dir, S_IFLNK|S_IRWXUGO, 0, VM_NORESERVE, 0);
 	if (!inode)
 		return -ENOSPC;
 
@@ -2545,13 +2550,12 @@ static int shmem_symlink(struct inode *dir, struct dentry *dentry, const char *s
 	info = SHMEM_I(inode);
 	inode->i_size = len-1;
 	if (len <= SHORT_SYMLINK_LEN) {
-		info->symlink = kmemdup(symname, len, GFP_KERNEL);
-		if (!info->symlink) {
+		inode->i_link = kmemdup(symname, len, GFP_KERNEL);
+		if (!inode->i_link) {
 			iput(inode);
 			return -ENOMEM;
 		}
 		inode->i_op = &shmem_short_symlink_operations;
-		inode->i_link = info->symlink;
 	} else {
 		inode_nohighmem(inode);
 		error = shmem_getpage(inode, 0, &page, SGP_WRITE, NULL);
@@ -3008,7 +3012,7 @@ SYSCALL_DEFINE2(memfd_create,
 		goto err_name;
 	}
 
-	file = shmem_file_setup(name, 0, VM_NORESERVE);
+	file = shmem_file_setup(name, 0, VM_NORESERVE, 0);
 	if (IS_ERR(file)) {
 		error = PTR_ERR(file);
 		goto err_fd;
@@ -3099,7 +3103,7 @@ int shmem_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_flags |= MS_POSIXACL;
 #endif
 
-	inode = shmem_get_inode(sb, NULL, S_IFDIR | sbinfo->mode, 0, VM_NORESERVE);
+	inode = shmem_get_inode(sb, NULL, S_IFDIR | sbinfo->mode, 0, VM_NORESERVE, 0);
 	if (!inode)
 		goto failed;
 	inode->i_uid = sbinfo->uid;
@@ -3128,6 +3132,7 @@ static struct inode *shmem_alloc_inode(struct super_block *sb)
 static void shmem_destroy_callback(struct rcu_head *head)
 {
 	struct inode *inode = container_of(head, struct inode, i_rcu);
+	kfree(inode->i_link);
 	kmem_cache_free(shmem_inode_cachep, SHMEM_I(inode));
 }
 
@@ -3354,7 +3359,7 @@ EXPORT_SYMBOL_GPL(shmem_truncate_range);
 
 #define shmem_vm_ops				generic_file_vm_ops
 #define shmem_file_operations			ramfs_file_operations
-#define shmem_get_inode(sb, dir, mode, dev, flags)	ramfs_get_inode(sb, dir, mode, dev)
+#define shmem_get_inode(sb, dir, mode, dev, flags, atomic_copy)	ramfs_get_inode(sb, dir, mode, dev)
 #define shmem_acct_size(flags, size)		0
 #define shmem_unacct_size(flags, size)		do {} while (0)
 
@@ -3367,7 +3372,8 @@ static struct dentry_operations anon_ops = {
 };
 
 static struct file *__shmem_file_setup(const char *name, loff_t size,
-				       unsigned long flags, unsigned int i_flags)
+				       unsigned long flags, unsigned int i_flags,
+				       int atomic_copy)
 {
 	struct file *res;
 	struct inode *inode;
@@ -3396,7 +3402,7 @@ static struct file *__shmem_file_setup(const char *name, loff_t size,
 	d_set_d_op(path.dentry, &anon_ops);
 
 	res = ERR_PTR(-ENOSPC);
-	inode = shmem_get_inode(sb, NULL, S_IFREG | S_IRWXUGO, 0, flags);
+	inode = shmem_get_inode(sb, NULL, S_IFREG | S_IRWXUGO, 0, flags, atomic_copy);
 	if (!inode)
 		goto put_memory;
 
@@ -3432,9 +3438,9 @@ put_path:
  * @size: size to be set for the file
  * @flags: VM_NORESERVE suppresses pre-accounting of the entire object size
  */
-struct file *shmem_kernel_file_setup(const char *name, loff_t size, unsigned long flags)
+struct file *shmem_kernel_file_setup(const char *name, loff_t size, unsigned long flags, int atomic_copy)
 {
-	return __shmem_file_setup(name, size, flags, S_PRIVATE);
+	return __shmem_file_setup(name, size, flags, S_PRIVATE, atomic_copy);
 }
 
 /**
@@ -3443,9 +3449,9 @@ struct file *shmem_kernel_file_setup(const char *name, loff_t size, unsigned lon
  * @size: size to be set for the file
  * @flags: VM_NORESERVE suppresses pre-accounting of the entire object size
  */
-struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags)
+struct file *shmem_file_setup(const char *name, loff_t size, unsigned long flags, int atomic_copy)
 {
-	return __shmem_file_setup(name, size, flags, 0);
+	return __shmem_file_setup(name, size, flags, 0, atomic_copy);
 }
 EXPORT_SYMBOL_GPL(shmem_file_setup);
 
@@ -3464,7 +3470,7 @@ int shmem_zero_setup(struct vm_area_struct *vma)
 	 * accessible to the user through its mapping, use S_PRIVATE flag to
 	 * bypass file security, in the same way as shmem_kernel_file_setup().
 	 */
-	file = __shmem_file_setup("dev/zero", size, vma->vm_flags, S_PRIVATE);
+	file = __shmem_file_setup("dev/zero", size, vma->vm_flags, S_PRIVATE, 0);
 	if (IS_ERR(file))
 		return PTR_ERR(file);
 

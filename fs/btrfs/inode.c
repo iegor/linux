@@ -3134,7 +3134,6 @@ void btrfs_run_delayed_iputs(struct btrfs_root *root)
 {
 	struct btrfs_fs_info *fs_info = root->fs_info;
 
-	down_read(&fs_info->delayed_iput_sem);
 	spin_lock(&fs_info->delayed_iput_lock);
 	while (!list_empty(&fs_info->delayed_iputs)) {
 		struct btrfs_inode *inode;
@@ -3153,7 +3152,6 @@ void btrfs_run_delayed_iputs(struct btrfs_root *root)
 		spin_lock(&fs_info->delayed_iput_lock);
 	}
 	spin_unlock(&fs_info->delayed_iput_lock);
-	up_read(&root->fs_info->delayed_iput_sem);
 }
 
 /*
@@ -4874,26 +4872,6 @@ next:
 	return err;
 }
 
-static int wait_snapshoting_atomic_t(atomic_t *a)
-{
-	schedule();
-	return 0;
-}
-
-static void wait_for_snapshot_creation(struct btrfs_root *root)
-{
-	while (true) {
-		int ret;
-
-		ret = btrfs_start_write_no_snapshoting(root);
-		if (ret)
-			break;
-		wait_on_atomic_t(&root->will_be_snapshoted,
-				 wait_snapshoting_atomic_t,
-				 TASK_UNINTERRUPTIBLE);
-	}
-}
-
 static int btrfs_setsize(struct inode *inode, struct iattr *attr)
 {
 	struct btrfs_root *root = BTRFS_I(inode)->root;
@@ -4925,7 +4903,7 @@ static int btrfs_setsize(struct inode *inode, struct iattr *attr)
 		 * truncation, it must capture all writes that happened before
 		 * this truncation.
 		 */
-		wait_for_snapshot_creation(root);
+		btrfs_wait_for_snapshot_creation(root);
 		ret = btrfs_cont_expand(inode, oldsize, newsize);
 		if (ret) {
 			btrfs_end_write_no_snapshoting(root);
@@ -5739,6 +5717,7 @@ static int btrfs_real_readdir(struct file *file, struct dir_context *ctx)
 	char *name_ptr;
 	int name_len;
 	int is_curr = 0;	/* ctx->pos points to the current index? */
+	bool emitted;
 
 	/* FIXME, use a real flag for deciding about the key type */
 	if (root->fs_info->tree_root == root)
@@ -5767,6 +5746,7 @@ static int btrfs_real_readdir(struct file *file, struct dir_context *ctx)
 	if (ret < 0)
 		goto err;
 
+	emitted = false;
 	while (1) {
 		leaf = path->nodes[0];
 		slot = path->slots[0];
@@ -5846,6 +5826,7 @@ skip:
 
 			if (over)
 				goto nopos;
+			emitted = true;
 			di_len = btrfs_dir_name_len(leaf, di) +
 				 btrfs_dir_data_len(leaf, di) + sizeof(*di);
 			di_cur += di_len;
@@ -5858,10 +5839,19 @@ next:
 	if (key_type == BTRFS_DIR_INDEX_KEY) {
 		if (is_curr)
 			ctx->pos++;
-		ret = btrfs_readdir_delayed_dir_index(ctx, &ins_list);
+		ret = btrfs_readdir_delayed_dir_index(ctx, &ins_list, &emitted);
 		if (ret)
 			goto nopos;
 	}
+
+	/*
+	 * If we haven't emitted any dir entry, we must not touch ctx->pos as
+	 * it was was set to the termination value in previous call. We assume
+	 * that "." and ".." were emitted if we reach this point and set the
+	 * termination value as well for an empty directory.
+	 */
+	if (ctx->pos > 2 && !emitted)
+		goto nopos;
 
 	/* Reached end of directory/root. Bump pos past the last item. */
 	ctx->pos++;
@@ -7138,21 +7128,41 @@ static struct extent_map *btrfs_new_extent_direct(struct inode *inode,
 	if (ret)
 		return ERR_PTR(ret);
 
-	em = create_pinned_em(inode, start, ins.offset, start, ins.objectid,
-			      ins.offset, ins.offset, ins.offset, 0);
-	if (IS_ERR(em)) {
-		btrfs_free_reserved_extent(root, ins.objectid, ins.offset, 1);
-		return em;
-	}
-
+	/*
+	 * Create the ordered extent before the extent map. This is to avoid
+	 * races with the fast fsync path that would lead to it logging file
+	 * extent items that point to disk extents that were not yet written to.
+	 * The fast fsync path collects ordered extents into a local list and
+	 * then collects all the new extent maps, so we must create the ordered
+	 * extent first and make sure the fast fsync path collects any new
+	 * ordered extents after collecting new extent maps as well.
+	 * The fsync path simply can not rely on inode_dio_wait() because it
+	 * causes deadlock with AIO.
+	 */
 	ret = btrfs_add_ordered_extent_dio(inode, start, ins.objectid,
 					   ins.offset, ins.offset, 0);
 	if (ret) {
 		btrfs_free_reserved_extent(root, ins.objectid, ins.offset, 1);
-		free_extent_map(em);
 		return ERR_PTR(ret);
 	}
 
+	em = create_pinned_em(inode, start, ins.offset, start, ins.objectid,
+			      ins.offset, ins.offset, ins.offset, 0);
+	if (IS_ERR(em)) {
+		struct btrfs_ordered_extent *oe;
+
+		btrfs_free_reserved_extent(root, ins.objectid, ins.offset, 1);
+		oe = btrfs_lookup_ordered_extent(inode, start);
+		ASSERT(oe);
+		if (WARN_ON(!oe))
+			return em;
+		set_bit(BTRFS_ORDERED_IOERR, &oe->flags);
+		set_bit(BTRFS_ORDERED_IO_DONE, &oe->flags);
+		btrfs_remove_ordered_extent(inode, oe);
+		/* Once for our lookup and once for the ordered extents tree. */
+		btrfs_put_ordered_extent(oe);
+		btrfs_put_ordered_extent(oe);
+	}
 	return em;
 }
 
@@ -7976,6 +7986,7 @@ static void btrfs_endio_direct_read(struct bio *bio)
 
 	kfree(dip);
 
+	dio_bio->bi_error = bio->bi_error;
 	dio_end_io(dio_bio, bio->bi_error);
 
 	if (io_bio->end_io)
@@ -8030,6 +8041,7 @@ static void btrfs_endio_direct_write(struct bio *bio)
 
 	kfree(dip);
 
+	dio_bio->bi_error = bio->bi_error;
 	dio_end_io(dio_bio, bio->bi_error);
 	bio_put(bio);
 }
@@ -8469,7 +8481,7 @@ static ssize_t btrfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter,
 		 * not unlock the i_mutex at this case.
 		 */
 		if (offset + count <= inode->i_size) {
-			mutex_unlock(&inode->i_mutex);
+			inode_unlock(inode);
 			relock = true;
 		}
 		ret = btrfs_delalloc_reserve_space(inode, offset, count);
@@ -8526,7 +8538,7 @@ out:
 	if (wakeup)
 		inode_dio_end(inode);
 	if (relock)
-		mutex_lock(&inode->i_mutex);
+		inode_lock(inode);
 
 	return ret;
 }
